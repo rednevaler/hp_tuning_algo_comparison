@@ -7,8 +7,10 @@ from skopt.space import Real, Categorical, Integer
 from skopt import gp_minimize
 import optuna
 import scipy
-from dask_ml.model_selection import HyperbandSearchCV
-from distributed import Client
+from hyperopt.pyll.stochastic import sample
+from time import ctime
+from math import log, ceil
+from random import random
 
 
 def roc_auc_scorer():
@@ -65,7 +67,7 @@ class HyperoptObjective(object):
                   
         #y_pred = model.predict_proba(self.X_val)
 
-        mean_cv_result = model.eval_metrics(val_pool,
+        mean_cv_result = model.eval_metrics(self.val_pool,
                                             metrics=['AUC'],
                                             ntree_start=(model.tree_count_ - 1))['AUC'][0]
         print('------------------ RES:', mean_cv_result)
@@ -99,7 +101,7 @@ class GaussianObjective(HyperoptObjective):
         #y_pred = model.predict_proba(self.X_val)
 
         #mean_cv_result = roc_auc_score(self.y_val, y_pred[:, 1])
-        mean_cv_result = model.eval_metrics(val_pool,
+        mean_cv_result = model.eval_metrics(self.val_pool,
                                             metrics=['AUC'],
                                             ntree_start=(model.tree_count_ - 1))['AUC'][0]
         print('------------------ RES:', mean_cv_result)
@@ -127,7 +129,7 @@ class OptunaObjective(HyperoptObjective):
         #y_pred = model.predict_proba(self.X_val)
 
         #mean_cv_result = roc_auc_score(self.y_val, y_pred[:, 1])
-        mean_cv_result = model.eval_metrics(val_pool,
+        mean_cv_result = model.eval_metrics(self.val_pool,
                                             metrics=['AUC'],
                                             ntree_start=(model.tree_count_ - 1))['AUC'][0]
         print('------------------ RES:', mean_cv_result)
@@ -192,7 +194,6 @@ def print_results(train_pool,
         print("------ %s ROC AUC = %f\n" % (name, roc_auc_res))
         results[name + "_acc"] = acc_res
         results[name + "_roc_auc"] = roc_auc_res
-                          return results
     return results
 
 
@@ -233,6 +234,183 @@ def catboost_from_cfg(train_pool,
         print('------------------ RES:', mean_cv_result)
         return -mean_cv_result
     return func  # Minimize!
+
+
+class Hyperband:
+
+    def __init__(self, get_params_function, try_params_function):
+        self.get_params = get_params_function
+        self.try_params = try_params_function
+
+        self.max_iter = 81  # maximum iterations per configuration
+        self.eta = 3  # defines configuration downsampling rate (default = 3)
+
+        self.logeta = lambda x: log(x) / log(self.eta)
+        self.s_max = int(self.logeta(self.max_iter))
+        self.B = (self.s_max + 1) * self.max_iter
+
+        self.results = []  # list of dicts
+        self.counter = 0
+        self.best_loss = np.inf
+        self.best_counter = -1
+
+    # can be called multiple times
+    def run(self, skip_last=0, dry_run=False):
+
+        for s in reversed(range(self.s_max + 1)):
+
+            # initial number of configurations
+            n = int(ceil(self.B / self.max_iter / (s + 1) * self.eta ** s))
+
+            # initial number of iterations per config
+            r = self.max_iter * self.eta ** (-s)
+
+            # n random configurations
+            T = [self.get_params() for i in range(n)]
+
+            for i in range((s + 1) - int(skip_last)):  # changed from s + 1
+
+                # Run each of the n configs for <iterations>
+                # and keep best (n_configs / eta) configurations
+
+                n_configs = n * self.eta ** (-i)
+                n_iterations = r * self.eta ** (i)
+
+                print("\n*** {} configurations x {:.1f} iterations each".format(n_configs, n_iterations))
+
+                val_losses = []
+                early_stops = []
+
+                for t in T:
+
+                    self.counter += 1
+                    print("\n{} | {} | lowest loss so far: {:.4f} (run {})\n".format(
+                        self.counter, ctime(), self.best_loss, self.best_counter))
+
+                    start_time = time.time()
+
+                    #if dry_run:
+                    #    result = {'loss': random(), 'log_loss': random(), 'auc': random()}
+                    #else:
+                    result = self.try_params(n_iterations, t)  # <---
+
+                    assert (type(result) == dict)
+                    assert ('loss' in result)
+
+                    seconds = int(round(time.time() - start_time))
+                    print("\n{} seconds.".format(seconds))
+
+                    loss = result['loss']
+                    val_losses.append(loss)
+
+                    early_stop = result.get('early_stop', False)
+                    early_stops.append(early_stop)
+
+                    # keeping track of the best result so far (for display only)
+                    # could do it be checking results each time, but hey
+                    if loss < self.best_loss:
+                        self.best_loss = loss
+                        self.best_counter = self.counter
+
+                    result['counter'] = self.counter
+                    result['seconds'] = seconds
+                    result['params'] = t
+                    result['iterations'] = n_iterations
+
+                    self.results.append(result)
+
+                # select a number of best configurations for the next loop
+                # filter out early stops, if any
+                indices = np.argsort(val_losses)
+                T = [T[i] for i in indices if not early_stops[i]]
+                T = T[0:int(n_configs / self.eta)]
+
+        return self.results
+
+
+def train_and_eval_catboost_classifier(clf,
+                                       train_pool,
+                                       val_pool,
+                                       test_pool,
+                                       cat_features):
+
+    clf.fit(train_pool,
+            eval_set=val_pool,
+            logging_level='Silent')
+
+
+    res = {}
+
+    acc_res = clf.score(train_pool)
+    roc_auc_res = clf.eval_metrics(train_pool, metrics=['AUC'], ntree_start=(clf.tree_count_ - 1))['AUC'][0]
+
+    print("\n# training | AUC: {:.2%}, accuracy: {:.2%}".format(roc_auc_res, acc_res))
+
+    res['Train_acc'] = acc_res
+    res['Train_roc_auc'] = roc_auc_res
+
+    acc_res = clf.score(test_pool)
+    roc_auc_res = clf.eval_metrics(test_pool, metrics=['AUC'], ntree_start=(clf.tree_count_ - 1))['AUC'][0]
+
+    res['Test_acc'] = acc_res
+    res['Test_roc_auc'] = roc_auc_res
+
+    print("# testing  | AUC: {:.2%}, accuracy: {:.2%}".format(roc_auc_res, acc_res))
+
+    acc_res = clf.score(val_pool)
+    roc_auc_res = clf.eval_metrics(val_pool, metrics=['AUC'], ntree_start=(clf.tree_count_ - 1))['AUC'][0]
+
+    res['Val_acc'] = acc_res
+    res['Val_roc_auc'] = roc_auc_res
+
+    print("# validation  | AUC: {:.2%}, accuracy: {:.2%}".format(roc_auc_res, acc_res))
+
+    res['loss'] = -roc_auc_res
+    res['auc'] = roc_auc_res
+    res['n_estimators'] = clf.tree_count_
+
+    # return { 'loss': 1 - auc, 'log_loss': ll, 'auc': auc }
+    # return { 'loss': ll, 'log_loss': ll, 'auc': auc }
+    return res
+
+
+def handle_integers(params):
+    new_params = {}
+    for k, v in params.items():
+        if type(v) == float and int(v) == v:
+            new_params[k] = int(v)
+        else:
+            new_params[k] = v
+
+    return new_params
+
+
+def get_params():
+    space = {
+        'learning_rate': hyperopt.hp.choice('lr', [hyperopt.hp.loguniform('lr_', -5., 0.)]),
+        'subsample': hyperopt.hp.choice('ss', [hyperopt.hp.uniform('ss_', 0., 1.)]),
+        'l2_leaf_reg': hyperopt.hp.choice('l2lr', [hyperopt.hp.loguniform('l2lr_', 0., np.log(10.))]),
+        'random_strength': hyperopt.hp.choice('rs', [hyperopt.hp.choice('rs_', np.arange(1, 21))]),
+        'leaf_estimation_iterations': hyperopt.hp.choice('lei', [hyperopt.hp.choice('lei_', np.arange(1, 11))])
+    }
+
+    params = sample(space)
+    params = {k: v for k, v in params.items() if v is not 'default'}
+    return handle_integers(params)
+
+
+
+def try_params(train_pool, val_pool, test_pool, cat_features, n_estimators, task_type='CPU', bootstrap_type='MVS'):
+    def func(n_iterations, params):
+        trees_per_iteration = max(1, n_estimators // 27)
+        n_estimators_ = int(round(n_iterations * trees_per_iteration))
+        print("n_estimators:", n_estimators_)
+        clf = CatBoostClassifier(n_estimators=n_estimators_,
+                                 task_type=task_type,
+                                 bootstrap_type=bootstrap_type,
+                                 **params)
+        return train_and_eval_catboost_classifier(clf, train_pool, val_pool, test_pool, cat_features)
+    return func
 
 
 def choose_classic(train_pool,
@@ -411,154 +589,53 @@ def choose_optuna(train_pool,
     return results
 
 
-def choose_hyperband(X_train,
-                     X_test,
-                     X_val,
-                     y_train,
-                     y_test,
-                     y_val,
-                     cat_features,
-                     n_estimators=1000,
-                     max_evals=25,
-                     task_type="CPU"):
-    client = Client()
-    const_params = {'n_estimators': n_estimators,
-                    'task_type': task_type}
-    for i in cat_features:
-        print(i)
-        if type(X_train) in [list, np.array, np.ndarray]:
-            unique_feature = list(set(X_train[:, i]).add(X_val[:, i]).add(X_test[:, i]))
-        else:
-            column = X_train.columns[i]
-            unique_feature = list(
-                    set(list(X_train[column])).union(
-                    set(list(X_val[column]))).union(
-                    set(list(X_test[column]))))
-        unique_feature_dict = dict(zip(unique_feature, list(range(len(unique_feature)))))
-        if type(X_train) in [list, np.array, np.ndarray]:
-            X_train[:, i] = np.vectorize(unique_feature_dict.get)(X_train[:, i])
-            X_val[:, i] = np.vectorize(unique_feature_dict.get)(X_val[:, i])
-            X_test[:, i] = np.vectorize(unique_feature_dict.get)(X_test[:, i])
-        else:
-            column = X_train.columns[i]
-            X_train[column] = np.vectorize(unique_feature_dict.get)(X_train[column])
-            X_val[column] = np.vectorize(unique_feature_dict.get)(X_val[column])
-            X_test[column] = np.vectorize(unique_feature_dict.get)(X_test[column])
+def choose_hyperband2(train_pool,
+                      val_pool,
+                      test_pool,
+                      cat_features,
+                      n_estimators=1000,
+                      max_evals=25,
+                      task_type="CPU"):
+    hb = Hyperband(get_params, try_params(train_pool,
+                                          val_pool,
+                                          test_pool,
+                                          cat_features,
+                                          n_estimators,
+                                          task_type))
+    results = hb.run(skip_last=1)
+    print("{} total, best:\n".format(len(results)))
+    best_results = {}
 
-    parameter_space = {
-        'learning_rate': scipy.stats.loguniform(np.exp(-5), 1.),
-        'random_strength': scipy.stats.randint(1, 21),
-        'l2_leaf_reg': scipy.stats.loguniform(1., 10.),
-        'subsample': scipy.stats.uniform(0., 1.),
-        'leaf_estimation_iterations': scipy.stats.randint(1, 11),
-        'n_estimators': [n_estimators],
-        'cat_features':[cat_features],
-        'eval_set': [(X_val, y_val)],
-        'logging_level': ['Silent']
-    }
-    if task_type == 'CPU':
-        parameter_space['bootstrap_type'] = 'MVS'
-    else:
-        parameter_space['bootstrap_type'] = 'Poisson'
-    model = CatBoostClassifier(**const_params)
-    search = HyperbandSearchCV(model, parameter_space, scoring=roc_auc_scorer)
-    search.fit(X_train, y_train)
-    print("CatBoost + HyperBand")
-    print_results(X_train,
-                  X_val,
-                  X_test,
-                  y_train,
-                  y_val,
-                  y_test,
-                  search)
+    for r in sorted(results, key=lambda x: x['loss'])[:1]:
+        print("val_auc: {:.4} | {} seconds | {:.1f} iterations | run {} ".format(
+            r['auc'] / 100., r['seconds'], r['iterations'], r['counter']))
+        for key in ["Train_acc", "Train_roc_auc", "Test_acc", "Test_roc_auc", "Val_acc", "Val_roc_auc"]:
+            best_results[key] = r[key]
+        print()
+
+    return best_results
 
 
-def choose_smac(X_train,
-                X_test,
-                X_val,
-                y_train,
-                y_test,
-                y_val,
-                cat_features,
-                n_estimators=1000,
-                max_evals=25,
-                task_type="CPU"):
-    from ConfigSpace.conditions import InCondition
-    from ConfigSpace.hyperparameters import CategoricalHyperparameter, \
-        UniformFloatHyperparameter, UniformIntegerHyperparameter
-    from smac.configspace import ConfigurationSpace
-    from smac.facade.smac_hpo_facade import SMAC4HPO
-    from smac.scenario.scenario import Scenario
-    cs = ConfigurationSpace()
-
-    learning_rate = UniformFloatHyperparameter("learning_rate", np.exp(-5), 1., log=True)
-    l2_leaf_reg = UniformFloatHyperparameter("l2_leaf_reg", 1., 10., log=True)
-    subsample = UniformFloatHyperparameter("subsample", 0., 1., log=False)
-    random_strength = UniformIntegerHyperparameter("random_strength", 1, 21)
-    leaf_estimation_iterations = UniformIntegerHyperparameter("leaf_estimation_iterations", 1, 11)
-
-    cs.add_hyperparameters([learning_rate,
-                            random_strength,
-                            l2_leaf_reg,
-                            subsample,
-                            leaf_estimation_iterations])
-
-    scenario = Scenario({"run_obj": "quality",  # we optimize quality (alternatively runtime)
-                         "runcount-limit": max_evals,
-                         # max. number of function evaluations; for this example set to a low number
-                         "cs": cs,  # configuration space
-                         "deterministic": "true"
-                         })
-    smac = SMAC4HPO(scenario=scenario, rng=np.random.RandomState(42),
-                    tae_runner=catboost_from_cfg(X_train,
-                                                 X_test,
-                                                 X_val,
-                                                 y_train,
-                                                 y_test,
-                                                 y_val,
-                                                 cat_features,
-                                                 n_estimators,
-                                                 max_evals,
-                                                 task_type))
-    incumbent = smac.optimize()
-    inc_value = catboost_from_cfg(X_train,
-                                  X_test,
-                                  X_val,
-                                  y_train,
-                                  y_test,
-                                  y_val,
-                                  cat_features,
-                                  n_estimators,
-                                  max_evals,
-                                  task_type)(incumbent)
-    print(inc_value)
-    print(dir(incumbent))
-
-
-
-def hp_tuning(train, test, validate, column_description, algo_name):
+def hp_tuning(train, test, validate, column_description, algo_name, result_path):
     train_pool = Pool(train, column_description=column_description)
     val_pool = Pool(validate, column_description=column_description)
     test_pool = Pool(test, column_description=column_description)
-    #X_train, y_train = train_pool.get_features(), train_pool.get_label()
-    #X_val, y_val = val_pool.get_features(), val_pool.get_label()
-    #X_test, y_test = test_pool.get_features(), test_pool.get_label()
     cat_features = train_pool.get_cat_feature_indices()
 
     n_estimators = 1000
     max_evals = 50
     task_type = 'CPU'
     
-    #choose_hyperband,
-    #choose_smac
     if algo_name == 'classic':
         func = choose_classic
-    elif algo_name == 'hyperOpt':
+    elif algo_name == 'hyperopt':
         func = choose_hyperOpt
     elif algo_name == 'gaussian':
         func = choose_gaussian
     elif algo_name == 'optuna':
         func = choose_optuna
+    elif algo_name == 'hyperband':
+        func = choose_hyperband2
     else:
         print("INCORRECT ALGO NAME!!!")
         return
@@ -571,9 +648,8 @@ def hp_tuning(train, test, validate, column_description, algo_name):
                    max_evals=max_evals,
                    task_type=task_type)
     end = time.time()
-    results["algo_name"] = algo_name
     results["time"] = end - start
-    with open('results.txt', 'w') as outfile:
+    with open(result_path, 'w') as outfile:
         json.dump(results, outfile)
 
 
@@ -582,4 +658,4 @@ import json
 import time
 
 if __name__ == '__main__':
-    hp_tuning(sys.argv)
+    hp_tuning(*sys.argv[1:])
